@@ -3,241 +3,239 @@ import numpy
 import math
 import georinex as gr
 import SNIVEL_orbits
-import datetime
-from SNIVEL_filedownloader import getbcorbit, getrinexhr
-from SNIVEL_tools import azi_elev, klobuchar, ecef2lla, gpsweekdow, getklobucharvalues, niell, dxyz2dneu, printProgressBar, niell_wet
-from SNIVEL_tools import writesac
+from SNIVEL_filedownloader import getbcorbit
+from SNIVEL_tools import (gpsweekdow, dxyz2dneu, ecef2lla_optimized,
+                          azi_elev_optimized, klobuchar_optimized,
+                          getklobucharvalues_optimized, niell_optimized,
+                          niell_wet_optimized, writesac, doy_calc)
 import os
 from scipy.optimize import lsq_linear
-#####################################################################################
-#SNIVEL.py
-#This code will process the input files on the dates specified and produce velocities
-#This uses the ionospheric free range combination to determine velocity
-#Written by Brendan Crowell, University of Washington
-#Last modified February 18, 2020
-#Input files of testing sites and testing dates is required, the format is rather simple
-#Follow the examples provided
-#####################################################################################
-event='process'
-c = 299792458.0 #speed of light
-fL1 = 1575.42e6 #L1 frequency
-fL2 = 1227.60e6 #L2 frequency
-wL1 = c/fL1 #L1 wavelength
-wL2 = c/fL2 #L2 wavelength
-sitefile='sites_'+event+'.txt'
-datefile='dates_'+event+'.txt'
-#sampersec=1 #samples per second...this is now pulled from header
-elevmask = 7 #elevation mask
-clockdrift= 1e-7 #maximum clock drift rate
-maxvel = 1 #the maximum velocity between samples. If 1 Hz, 1 == 1 m/s. At 5 Hz, 1 = 5 m/s
-#####################################################################################
-##Preprocessing
-#This section reads in the RINEX, apriori locations and orbit files and forms an
-#observable file in the output folder
-#I suggest only running up to 30 minutes of data at a time. You can process an entire day
-#but it will take awhile. To modify this, the last two columns in dates_process.txt
-#have the start time and the number of minutes you wish to process. Remember to include enough
-#pre-event time and to account for leap seconds. RINEX files are in GPS time and it is 18 s
-#ahead of UTC as of Feb, 2020. I perform no corrections for leap seconds.
-with open(sitefile, 'rt') as g:
-    rows = (line.split() for line in g)
-    for grow in rows:
-        site = grow[0] #looping over sites to process
-        with open(datefile, 'rt') as f:
-                rows2 = (line.split() for line in f)
-                for grow2 in rows2:
-                        year = grow2[0] #looping over years and days of year to process
-                        doy = grow2[1]
-                        st = grow2[2]
-                        nummin = grow2[3]
-                        #print('Processing station ', site, ' on year and  day ', year,  doy)
-                        if not os.path.exists('output'): #if output folder doesn't exist, make it
-                            os.makedirs('output')
-                        if not os.path.exists('output/sac/'+event): #if output folder doesn't exist, make it
-                            os.makedirs('output/sac/'+event)
-                        if not os.path.exists('output/sacfilt/'+event): #if output folder doesn't exist, make it
-                            os.makedirs('output/sacfilt/'+event)
-                        if not os.path.exists('output/fig/'+event): #if output folder doesn't exist, make it
-                            os.makedirs('output/fig/'+event)
-                        outfile = 'output/observables_' + site + '_' + doy + '_' + year + '.txt'
-                        ffo = open(outfile,'w')
-                        #obtain gps week and day of week for sp3 file download...not needed here
-                        [gpsweek,gpsdow]=gpsweekdow(int(year),int(doy))
-                        week = str(int(gpsweek)) #convert to strings
-                        dow = str(int(gpsdow))
 
-                        getbcorbit(year, doy) #Download broadcast orbit
-                        try:
-                            getrinexhr(site, year, doy) #Download RINEX
 
-                            obsfile = 'rinex_hr/' + site + doy + '0.' +  year[-2:] + 'o' #rinex file name
-                            navfile = 'nav/brdc' + doy + '0.' +  year[-2:] + 'n' #broadcast navigation file name
+def ensure_dir(directory):
+    if not os.path.exists(directory):
+        os.makedirs(directory)
 
-                            #use teqc to convert the rinex to remove comments within and remove non gps satellites
-                            #Also, the -st command sets the start time and +dm is the number of minutes to consider
-                            os.system('./teqc -R -E -S -C -J -phc -st ' + st + ' +dm ' + nummin + ' ' + obsfile + ' > example.o')
-                            #os.system('tac example.o | sed -e "/post/{N;d;}" | tac > example2.o') #remove the comment lines that teqc didn't remove
-                            header=gr.rinexheader('example.o')#read the RINEX header
-                            (x0,y0,z0)=header['position'] #use the a priori location of the site from the RINEX header. If its really bad, you might want to change it
-                            samfreq = header['interval'] #interval between observations
-                            sampersec = int(1/float(samfreq)) #sampling rate
-                            sampersec = 1/float(samfreq)
-                            [latsta,lonsta,altsta]=ecef2lla(float(x0),float(y0),float(z0)) #station lat and lon are needed for klobuchar correction
-                            print (site, latsta*180/math.pi, lonsta*180/math.pi, altsta)
-                            nav = gr.load(navfile) #Load the broadcast navigation file
-                            [alpha,beta]=getklobucharvalues(navfile) #get klobuchar corrections from navigation file
 
-                            obs = gr.load('example.o') #Load the RINEX file
+def download_and_prepare(site, year, doy, samprate, event='post'):
+    ensure_dir('output')
+    ensure_dir(f'output/sac')
+    ensure_dir(f'output/sacfilt')
+    ensure_dir(f'output/fig')
+    outfile = f'output/observables_{site}_{doy}_{year}.txt'
+    veloutfile = f'output/velocities_{site}_{doy}_{year}.txt'
+    navfile = f'nav/brdc{doy}0.{str(year)[-2:]}n'
+    pngfile = f'output/fig/{event}_vel_{site}_{year}_{doy}.png'
+    sr = "{0:.2f}".format(float(samprate))
+    sacnfile = f'output/sacfilt/{event}_{site.upper()}.{sr}.filt.LXN.sac'
+    sacefile = f'output/sacfilt/{event}_{site.upper()}.{sr}.filt.LXE.sac'
+    saczfile = f'output/sacfilt/{event}_{site.upper()}.{sr}.filt.LXZ.sac'
+    getbcorbit(str(year), str(doy))
+    return outfile, veloutfile, navfile, pngfile, sacnfile, sacefile, saczfile
 
-                            L1 = obs['L1'].values#phase values
-                            L2 = obs['L2'].values
-                            S1 = obs['S1'].values
-                            S2 = obs['S2'].values
 
-                            obs_time = obs.time.values #observation times
-                            nt = len(obs_time) #number of observation times
-                            svs = obs.sv #satellites observed
-                            ns = len(svs) #number of satellites observed
+def gnss_vel_cal(rinex_file_path):
+    obsfile = rinex_file_path
+    site = os.path.basename(obsfile)[0:4]
+    header = gr.rinexheader(rinex_file_path)
+    samfreq = float(header['interval'])
+    t0 = header['t0']
+    year, month, day = t0.year, t0.month, t0.day
+    doy = doy_calc(year, month, day)
+    outfile, veloutfile, navfile, pngfile, sacnfile, sacefile, saczfile = download_and_prepare(
+        site, year, doy, samfreq)
+    [gpsweek, gpsdow] = gpsweekdow(int(year), int(doy))
 
-                            for i in range (0, nt):
-                                printProgressBar(i,nt, prefix = 'Writing Obs File:',suffix = 'Complete', length = 25)
-                                gps_time = (numpy.datetime64(obs_time[i]) - numpy.datetime64('1980-01-06T00:00:00'))/ numpy.timedelta64(1, 's') #compute gps time, seconds from Jan 6, 1980
-                                gps_sow = float(gps_time) - gpsweek*604800 #determine gps second of week
-                                for j in range (0, ns):
-                                    total_val = float(float(L2[i,j])+float(L1[i,j])) #if any of these 2 observables don't exist, don't record
-                                    if (math.isfinite(total_val)):
-                                        sv1 = svs.sv[j]
-                                        if "G" in str(sv1.values):
-                                            [x,y,z,tr,rho,tsv]=SNIVEL_orbits.bcorbit(nav,sv1.values,gps_sow,x0,y0,z0) #compute satellite location, clock, and relativistic term with broadcast orbits
-                                            [azi,elev]=azi_elev(x0,y0,z0,x,y,z) #compute azimuth and elevation angles. Broadcast orbits are good enough here
-                                            Mdry=niell(elev,latsta*180/math.pi,altsta,int(doy))#this is the niell dry troposphere delay
-                                            Mwet=niell_wet(elev,latsta*180/math.pi)#Niell wet tropospheric delay
-                                            [dIon1,dIon2]=klobuchar(float(latsta)*180/math.pi,float(lonsta)*180/math.pi,float(elev),float(azi),gps_sow,alpha,beta) #compute the klobuchar correction for broadcast
-                                            rclock=(tr+tsv)*c #relativistic clock correction with broadcast clock correction
-                                            #Reformat to strings to output to observation file
-                                            l1 = "{0:.5f}".format(float(L1[i,j])*wL1+rclock) #L1 with clock corrections in meters
-                                            l2 = "{0:.5f}".format(float(L2[i,j])*wL2+rclock) #L2 with clock corrections in meters
-                                            rx0 = "{0:.9f}".format(float((x0-x)/rho)) #Direction cosine, x
-                                            ry0 = "{0:.9f}".format(float((y0-y)/rho)) #Direction cosine, y
-                                            rz0 = "{0:.9f}".format(float((z0-z)/rho)) #Direction cosine, z
-                                            az = "{0:.2f}".format(float(azi)) #azimuth between receiver and satellite
-                                            el = "{0:.2f}".format(float(elev)) #elevation angle between receiver and satellite
-                                            rhotrue = "{0:.5f}".format(float(rho)) #true range between satellite and a priori position of station
-                                            di1 = "{0:.5f}".format(dIon1) #Klobuchar ionospheric delay on L1
-                                            di2 = "{0:.5f}".format(dIon2) #Klobuchar ionospheric delat on L2
-                                            shd = "{0:.5f}".format(Mdry) #Niell slant hydrostatic delay
-                                            swd = "{0:.5f}".format(Mwet) #Niell slant wet delay
-                                            gpst = "{0:.2f}".format(float(gps_time)) #gps time, continuous seconds since Jan 6, 1980
-                                            gpsw = "{0:.0f}".format(float(gpsweek)) #gps week
-                                            gpss = "{0:.2f}".format(float(gps_sow)) #gps second of week
-                                            svstrip = str(sv1.values)[1:]
-                                            dxsat = "{0:.6f}".format(float((x0-x))) #distance between receiver and satellite in x
-                                            dysat = "{0:.6f}".format(float((y0-y))) #distance between receiver and satellite in y
-                                            dzsat = "{0:.6f}".format(float((z0-z))) #distance between receiver and satellite in z
-                                            s1 = "{0:.2f}".format(float(S1[i,j]))
-                                            s2 = "{0:.2f}".format(float(S2[i,j]))
-                                            ffo.write(str(i)+' '+gpst+' '+gpsw+' '+gpss+' '+svstrip+' '+rx0+' '+ry0+' '+rz0+' '+l1+' '+l2+' '+az+' '+el+' '+di1+' '+di2+' '+shd+' '+dxsat+' '+dysat+' '+dzsat+' '+swd+' '+s1+' '+s2+'\n')
+    c = 299792458.0
+    fL1 = 1575.42e6
+    fL2 = 1227.60e6
+    wL1 = c / fL1
+    wL2 = c / fL2
+    elevmask = 10
+    clockdrift = 1e-7
+    maxvel = 1
 
-                            ffo.close()
-                            #####################################################################################
-                            #Load the observables file, compute velocities
-                            #Refer to section above about variable names
-                            #####################################################################################
-                            veloutfile = 'output/velocities_' + site + '_' + doy + '_' + year + '.txt'
-                            ffo = open(veloutfile,'w')
-                            a = numpy.loadtxt(outfile)
-                            tind = a[:,0]
-                            gtime = a[:,1]
-                            svind = a[:,4]
-                            i1corr = a[:,12]
-                            i2corr = a[:,13]
-                            shdcorr = a[:,14]
+    try:
+        (x0, y0, z0) = header['position']
+        sampersec = 1 / samfreq
+        [latsta, lonsta, altsta] = ecef2lla_optimized(float(x0), float(y0),
+                                                      float(z0))
+        nav = gr.load(navfile)
+        [alpha, beta] = getklobucharvalues_optimized(navfile)
+        obs = gr.load(obsfile)
+        L1 = obs['L1'].values
+        L2 = obs['L2'].values
+        obs_time = obs.time.values
+        nt = len(obs_time)
+        svs = obs.sv
+        ns = len(svs)
+        lines_to_write = []
+        for i in range(0, nt):
+            gps_time = (numpy.datetime64(obs_time[i]) -
+                        numpy.datetime64('1980-01-06T00:00:00')
+                        ) / numpy.timedelta64(1, 's')
+            gps_sow = float(gps_time) - gpsweek * 604800
+            for j in range(0, ns):
+                sv1 = svs.sv[j]
+                total_val = float(float(L2[i, j]) + float(L1[i, j]))
+                if "G" not in str(sv1.values) or not math.isfinite(total_val):
+                    continue
+                [x, y, z, tr, rho,
+                 tsv] = SNIVEL_orbits.bcorbit(nav, sv1.values, gps_sow, x0, y0,
+                                              z0)
+                [azi, elev] = azi_elev_optimized(x0, y0, z0, x, y, z)
+                Mdry = niell_optimized(elev, latsta * 180 / math.pi, altsta,
+                                       int(doy))
+                Mwet = niell_wet_optimized(elev, latsta * 180 / math.pi)
+                [dIon1, dIon2] = klobuchar_optimized(
+                    float(latsta) * 180 / math.pi,
+                    float(lonsta) * 180 / math.pi, float(elev), float(azi),
+                    gps_sow, alpha, beta)
+                rclock = (tr + tsv) * c
+                l1 = "{0:.5f}".format(float(L1[i, j]) * wL1 + rclock)
+                l2 = "{0:.5f}".format(float(L2[i, j]) * wL2 + rclock)
+                rx0 = "{0:.9f}".format(float((x0 - x) / rho))
+                ry0 = "{0:.9f}".format(float((y0 - y) / rho))
+                rz0 = "{0:.9f}".format(float((z0 - z) / rho))
+                az = "{0:.2f}".format(float(azi))
+                el = "{0:.2f}".format(float(elev))
+                rhotrue = "{0:.5f}".format(float(rho))
+                di1 = "{0:.5f}".format(dIon1)
+                di2 = "{0:.5f}".format(dIon2)
+                shd = "{0:.5f}".format(Mdry)
+                swd = "{0:.5f}".format(Mwet)
+                gpst = "{0:.2f}".format(float(gps_time))
+                gpsw = "{0:.0f}".format(float(gpsweek))
+                gpss = "{0:.2f}".format(float(gps_sow))
+                svstrip = str(sv1.values)[1:]
+                dxsat = "{0:.6f}".format(float((x0 - x)))
+                dysat = "{0:.6f}".format(float((y0 - y)))
+                dzsat = "{0:.6f}".format(float((z0 - z)))
+                line = f"{i} {gpst} {gpsw} {gpss} {svstrip} {rx0} {ry0} {rz0} {l1} {l2} {az} {el} {di1} {di2} {shd} {dxsat} {dysat} {dzsat} {swd}\n"
+                lines_to_write.append(line)
+        with open(outfile, 'w') as ffo:
+            ffo.writelines(lines_to_write)
+        lines_to_write = []
+        a = numpy.loadtxt(outfile)
+        tind = a[:, 0]
+        gtime = a[:, 1]
+        svind = a[:, 4]
+        i1corr = a[:, 12]
+        i2corr = a[:, 13]
+        shdcorr = a[:, 14]
 
-                            rx = a[:,5]
-                            ry = a[:,6]
-                            rz = a[:,7]
-                            l1 = a[:,8]+i1corr-shdcorr
-                            l2 = a[:,9]+i2corr-shdcorr
-                            #l1 = a[:,8]
-                            #l2 = a[:,9]
-                            el = a[:,11]
-                            dxsat = a[:,15]
-                            dysat = a[:,16]
-                            dzsat = a[:,17]
-                            ub = numpy.zeros([1,4])
-                            lb = numpy.zeros([1,4])
-                            ub[0,0] = maxvel
-                            lb[0,0] = -maxvel
-                            ub[0,1] = maxvel
-                            lb[0,1] = -maxvel
-                            ub[0,2] = maxvel
-                            lb[0,2] = -maxvel
-                            ub[0,3] = clockdrift*c
-                            lb[0,3] = -clockdrift*c
+        rx = a[:, 5]
+        ry = a[:, 6]
+        rz = a[:, 7]
+        l1 = a[:, 8] + i1corr - shdcorr
+        l2 = a[:, 9] + i2corr - shdcorr
 
-                            tstart = numpy.amin(tind)+1
-                            tstop = numpy.amax(tind)
-                            for i in range (int(tstart),int(tstop)+1):
-                                a0 = numpy.where(tind == i-1)[0]
-                                a1 = numpy.where(tind == i)[0]
-                                l10 = l1[a0]
-                                l11 = l1[a1]
-                                l20 = l2[a0]
-                                l21 = l2[a1]
-                                sv0 = svind[a0]
-                                sv1 = svind[a1]
-                                dxsat0 = dxsat[a0]
-                                dxsat1 = dxsat[a1]
-                                dysat0 = dysat[a0]
-                                dysat1 = dysat[a1]
-                                dzsat0 = dzsat[a0]
-                                dzsat1 = dzsat[a1]
-                                rx0 = rx[a0]
-                                rx1 = rx[a1]
-                                ry0 = ry[a0]
-                                ry1 = ry[a1]
-                                rz0 = rz[a0]
-                                rz1 = rz[a1]
+        el = a[:, 11]
+        dxsat = a[:, 15]
+        dysat = a[:, 16]
+        dzsat = a[:, 17]
+        ub = numpy.zeros([1, 4])
+        lb = numpy.zeros([1, 4])
+        ub[0, 0] = maxvel
+        lb[0, 0] = -maxvel
+        ub[0, 1] = maxvel
+        lb[0, 1] = -maxvel
+        ub[0, 2] = maxvel
+        lb[0, 2] = -maxvel
+        ub[0, 3] = clockdrift * c
+        lb[0, 3] = -clockdrift * c
 
-                                el1 = el[a1]
+        tstart = numpy.amin(tind) + 1
+        tstop = numpy.amax(tind)
+        for i in range(int(tstart), int(tstop) + 1):
+            a0 = numpy.where(tind == i - 1)[0]
+            a1 = numpy.where(tind == i)[0]
+            l10 = l1[a0]
+            l11 = l1[a1]
+            l20 = l2[a0]
+            l21 = l2[a1]
+            sv0 = svind[a0]
+            sv1 = svind[a1]
+            dxsat0 = dxsat[a0]
+            dxsat1 = dxsat[a1]
+            dysat0 = dysat[a0]
+            dysat1 = dysat[a1]
+            dzsat0 = dzsat[a0]
+            dzsat1 = dzsat[a1]
+            rx0 = rx[a0]
+            rx1 = rx[a1]
+            ry0 = ry[a0]
+            ry1 = ry[a1]
+            rz0 = rz[a0]
+            rz1 = rz[a1]
 
-                                G = list() #Green's function
-                                W = list() #weight matrix
-                                Vdat = list() #variometric data
-                                if ((gtime[a1[0]]-gtime[a0[0]])  < 1/sampersec+0.005):
-                                    for j in range (0, len(sv1)):
-                                        asv = numpy.where(sv0 == sv1[j])[0]
-                                        if (len(asv)>0 and el1[j] > elevmask):
-                                            dran0 = math.sqrt(math.pow(dxsat0[int(asv)],2)+math.pow(dysat0[int(asv)],2)+math.pow(dzsat0[int(asv)],2))
-                                            dran1 = math.sqrt(math.pow(dxsat1[j],2)+math.pow(dysat1[j],2)+math.pow(dzsat1[j],2))
-                                            dran = dran1-dran0
-                                            l1diff = l11[j]-l10[int(asv)]-dran
-                                            l2diff = l21[j]-l20[int(asv)]-dran
-                                            nl = [fL1/(fL1+fL2)*l1diff + fL2/(fL1+fL2)*l2diff]
-                                            varvalL = [nl] #variometric value
-                                            Grow = [rx1[j], ry1[j], rz1[j], 1] #row of Green's function
-                                            Wrow = [el1[j]]
-                                            W.append(Wrow)
-                                            G.append(Grow) #append the row into Green's matrix
-                                            Vdat.append(nl)
+            el1 = el[a1]
 
-                                    Winv = numpy.asarray(W)
-                                    Winv = numpy.diagflat(Winv)
-                                    Ginv = numpy.asarray(G) #convert to numpy array
-                                    Vinv = numpy.asarray(Vdat)
+            G = list()
+            W = list()
+            Vdat = list()
+            if ((gtime[a1[0]] - gtime[a0[0]]) < 1 / sampersec + 0.005):
+                for j in range(0, len(sv1)):
+                    asv = numpy.where(sv0 == sv1[j])[0]
+                    if (len(asv) > 0 and el1[j] > elevmask):
+                        dran0 = math.sqrt(
+                            math.pow(dxsat0[int(asv)], 2) +
+                            math.pow(dysat0[int(asv)], 2) +
+                            math.pow(dzsat0[int(asv)], 2))
+                        dran1 = math.sqrt(
+                            math.pow(dxsat1[j], 2) + math.pow(dysat1[j], 2) +
+                            math.pow(dzsat1[j], 2))
+                        dran = dran1 - dran0
+                        l1diff = l11[j] - l10[int(asv)] - dran
+                        l2diff = l21[j] - l20[int(asv)] - dran
+                        nl = [
+                            fL1 / (fL1 + fL2) * l1diff + fL2 /
+                            (fL1 + fL2) * l2diff
+                        ]
+                        varvalL = [nl]
+                        Grow = [rx1[j], ry1[j], rz1[j], 1]
+                        Wrow = [el1[j]]
+                        W.append(Wrow)
+                        G.append(Grow)
+                        Vdat.append(nl)
 
-                                    WV = numpy.matmul(numpy.matmul(numpy.transpose(Ginv),Winv),Vinv)
-                                    GWGT = numpy.matmul(numpy.transpose(Ginv),numpy.matmul(Winv,Ginv))
-                                    S = lsq_linear(GWGT, WV.flatten(), bounds=(lb.flatten(), ub.flatten()), lsmr_tol='auto')
-                                    [dn,de,du]=dxyz2dneu(S.x[0],S.x[1],S.x[2],latsta*180/math.pi,lonsta*180/math.pi)
-                                    gpst = "{0:.2f}".format(float(gtime[a1[0]]))
-                                    nvel = "{0:.5f}".format(float(dn)*sampersec)
-                                    evel = "{0:.5f}".format(float(de)*sampersec)
-                                    uvel = "{0:.5f}".format(float(du)*sampersec)
-                                    ffo.write(str(i)+' '+gpst+' '+nvel+' '+evel+' '+uvel+'\n')
+                Winv = numpy.asarray(W)
+                Winv = numpy.diagflat(Winv)
+                Ginv = numpy.asarray(G)
+                Vinv = numpy.asarray(Vdat)
 
-                            ffo.close()
-                            writesac(veloutfile, site, latsta*180/math.pi, lonsta*180/math.pi, doy, year, 1/sampersec, event)
-                            print ('Station ', site, ' complete')
-                        except Exception:
-                            print ('Station ', site, ' not available on date ', str(year), ' ', str(doy))
+                WV = numpy.matmul(numpy.matmul(numpy.transpose(Ginv), Winv),
+                                  Vinv)
+                GWGT = numpy.matmul(numpy.transpose(Ginv),
+                                    numpy.matmul(Winv, Ginv))
+                S = lsq_linear(GWGT,
+                               WV.flatten(),
+                               bounds=(lb.flatten(), ub.flatten()),
+                               lsmr_tol='auto')
+                [dn, de, du] = dxyz2dneu(S.x[0], S.x[1], S.x[2],
+                                         latsta * 180 / math.pi,
+                                         lonsta * 180 / math.pi)
+                gpst = "{0:.2f}".format(float(gtime[a1[0]]))
+                nvel = "{0:.5f}".format(float(dn) * sampersec)
+                evel = "{0:.5f}".format(float(de) * sampersec)
+                uvel = "{0:.5f}".format(float(du) * sampersec)
+
+                line = f"{i} {gpst} {nvel} {evel} {uvel}\n"
+                lines_to_write.append(line)
+
+        with open(veloutfile, 'w') as ffo:
+            ffo.writelines(lines_to_write)
+
+        writesac(veloutfile, site, latsta * 180 / math.pi,
+                 lonsta * 180 / math.pi, doy, year, 1 / sampersec, "post")
+        return "OK", [veloutfile, pngfile, sacnfile, sacefile, saczfile]
+    except Exception as e:
+        return "Err", e
+
+
+if __name__ == '__main__':
+    print(gnss_vel_cal('rinex_hr/duow3521.23o'))
+
+# pip install georinex
+# pip install wget
+# pip install obspy
